@@ -182,6 +182,7 @@ def get_completed_stock_set(table: str, min_days_back: int) -> set[tuple[str, in
         """,
         (min_days_back,),
     )
+    return {(r['stock_code'], r['market']) for r in rows}
 
 
 def create_sync_log(sync_type: str, data_type: str, stock_code: str = None, market: int = None) -> int:
