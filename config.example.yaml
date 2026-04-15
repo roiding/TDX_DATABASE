@@ -1,0 +1,54 @@
+# TDX Database 配置文件
+# 复制此文件为 config.yaml 并填入真实信息
+
+mysql:
+  host: "your-cloud-mysql-host"
+  port: 3306
+  user: "root"
+  password: "your-password"
+  database: "tdx_data"
+  charset: "utf8mb4"
+  # 连接池配置
+  pool_size: 5
+  pool_recycle: 3600
+
+# pytdx 行情服务器（按优先级排列，自动failover）
+tdx_servers:
+  - host: "119.147.212.81"
+    port: 7709
+  - host: "112.74.214.43"
+    port: 7727
+  - host: "221.231.141.60"
+    port: 7709
+  - host: "101.227.73.20"
+    port: 7709
+  - host: "101.227.77.254"
+    port: 7709
+  - host: "14.215.128.18"
+    port: 7709
+  - host: "59.173.18.140"
+    port: 7709
+  - host: "180.153.39.51"
+    port: 7709
+
+# 同步配置
+sync:
+  # 每次API请求获取的K线条数（pytdx上限800）
+  batch_size: 800
+  # 单只股票最大回溯页数（防止无限循环）
+  max_pages: 20
+  # API请求间隔（秒），避免被服务器限流
+  request_interval: 0.1
+  # 失败重试次数
+  max_retries: 3
+  # 批量写入数据库的行数
+  db_batch_size: 5000
+  # 并发获取的连接数（pytdx单连接，此处指轮询复用）
+  workers: 1
+
+# 日志配置
+logging:
+  level: "INFO"
+  file: "logs/tdx_sync.log"
+  rotation: "10 MB"
+  retention: "30 days"

@@ -1,0 +1,9 @@
+services:
+  tdx-sync:
+    build: .
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    # 默认每日增量，可改为 ["full"] 做全量铺底
+    command: ["daily"]
+    restart: "no"
