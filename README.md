@@ -18,7 +18,11 @@ A股分钟级K线数据采集入库服务。从通达信行情服务器拉取 **
 | GET | `/api/kline/{code}?freq=5min&start=...&end=...&limit=1000` | K线查询 |
 | GET | `/api/xdxr/{code}` | 除权除息事件 |
 | GET | `/api/stats` | 数据库统计 |
-| POST | `/api/sync/full` | 触发全量铺底 |
+| POST | `/api/sync/full` | 兼容入口：全量铺底(all) |
+| POST | `/api/sync/full/resume` | 恢复续跑，自动跳过已完成阶段 |
+| POST | `/api/sync/full/xdxr` | 仅跑除权除息全量 |
+| POST | `/api/sync/full/5min` | 仅跑5分钟全量 |
+| POST | `/api/sync/full/1min` | 仅跑1分钟全量 |
 | POST | `/api/sync/daily` | 触发增量同步 |
 | GET | `/api/sync/status` | 同步状态 |
 | GET | `/docs` | Swagger 文档 |
@@ -39,8 +43,17 @@ docker run -d -p 8000:8000 \
 
 启动后：
 ```bash
-# 触发全量铺底（首次）
+# 兼容入口：触发全量铺底（all）
 curl -X POST http://localhost:8000/api/sync/full
+
+# 恢复续跑（推荐）
+curl -X POST http://localhost:8000/api/sync/full/resume
+
+# 单独跑5分钟全量
+curl -X POST http://localhost:8000/api/sync/full/5min
+
+# 单独跑1分钟全量
+curl -X POST http://localhost:8000/api/sync/full/1min
 
 # 查看同步状态
 curl http://localhost:8000/api/sync/status

@@ -30,7 +30,7 @@ _sync_lock = threading.Lock()
 _sync_status = {"running": False, "type": None, "message": "idle"}
 
 
-def _run_sync(sync_type: str, check_trading_day: bool = False):
+def _run_sync(sync_type: str, stage: str | None = None, check_trading_day: bool = False):
     """在后台线程中执行同步，防止并发"""
     if check_trading_day:
         from datetime import date
@@ -44,14 +44,15 @@ def _run_sync(sync_type: str, check_trading_day: bool = False):
         logger.warning(f"同步任务已在运行，跳过本次 {sync_type}")
         return
     try:
-        _sync_status.update(running=True, type=sync_type, message="running")
+        label = sync_type if not stage else f"{sync_type}:{stage}"
+        _sync_status.update(running=True, type=label, message="running")
         if sync_type == "full":
             from src.sync.full_sync import run_full_sync
-            run_full_sync()
+            run_full_sync(stage=stage or "all")
         else:
             from src.sync.daily_sync import run_daily_sync
             run_daily_sync()
-        _sync_status.update(running=False, type=None, message=f"last {sync_type} finished")
+        _sync_status.update(running=False, type=None, message=f"last {label} finished")
     except Exception as e:
         logger.error(f"同步异常: {e}")
         _sync_status.update(running=False, type=None, message=f"error: {e}")
@@ -70,10 +71,8 @@ async def lifespan(app: FastAPI):
     load_config()
     setup_logger()
 
-    # 自动建表
     init_database()
 
-    # 定时每日增量：工作日 16:30
     sync_cfg = get_config().get("sync", {})
     cron_hour = sync_cfg.get("daily_hour", 16)
     cron_minute = sync_cfg.get("daily_minute", 30)
@@ -95,35 +94,65 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="TDX Database", lifespan=lifespan)
 
 
+def _ensure_not_running():
+    if _sync_status["running"]:
+        raise HTTPException(409, f"同步任务正在运行: {_sync_status['type']}")
+
+
 # ============================================================
 # 同步控制 API
 # ============================================================
 
 @app.post("/api/sync/full")
 def trigger_full_sync():
-    """手动触发全量铺底"""
-    if _sync_status["running"]:
-        raise HTTPException(409, f"同步任务正在运行: {_sync_status['type']}")
-    threading.Thread(target=_run_sync, args=("full",), daemon=True).start()
-    return {"message": "全量同步已启动"}
+    """兼容入口：触发全量铺底（all）"""
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("full", "all"), daemon=True).start()
+    return {"message": "全量同步已启动", "stage": "all"}
+
+
+@app.post("/api/sync/full/resume")
+def trigger_full_resume():
+    """恢复模式：自动跳过已完成阶段，续跑剩余阶段"""
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("full", "resume"), daemon=True).start()
+    return {"message": "全量恢复同步已启动", "stage": "resume"}
+
+
+@app.post("/api/sync/full/xdxr")
+def trigger_full_xdxr():
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("full", "xdxr"), daemon=True).start()
+    return {"message": "xdxr 全量同步已启动", "stage": "xdxr"}
+
+
+@app.post("/api/sync/full/5min")
+def trigger_full_5min():
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("full", "5min"), daemon=True).start()
+    return {"message": "5min 全量同步已启动", "stage": "5min"}
+
+
+@app.post("/api/sync/full/1min")
+def trigger_full_1min():
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("full", "1min"), daemon=True).start()
+    return {"message": "1min 全量同步已启动", "stage": "1min"}
 
 
 @app.post("/api/sync/daily")
 def trigger_daily_sync():
-    """手动触发每日增量"""
-    if _sync_status["running"]:
-        raise HTTPException(409, f"同步任务正在运行: {_sync_status['type']}")
-    threading.Thread(target=_run_sync, args=("daily",), daemon=True).start()
+    _ensure_not_running()
+    threading.Thread(target=_run_sync, args=("daily", None), daemon=True).start()
     return {"message": "增量同步已启动"}
 
 
 @app.get("/api/sync/status")
 def sync_status():
-    """查询同步状态 + 最近同步记录"""
     logs = fetchall("""
         SELECT id, sync_type, data_type, stock_code, start_time, end_time,
                rows_synced, status, error_msg
-        FROM sync_log ORDER BY id DESC LIMIT 10
+        FROM sync_log ORDER BY id DESC LIMIT 20
     """)
     return {
         "current": _sync_status,
@@ -137,7 +166,6 @@ def sync_status():
 
 @app.get("/api/stocks")
 def list_stocks(stock_type: int = None):
-    """获取股票列表。stock_type: 0=股票, 1=指数, 2=ETF"""
     sql = "SELECT stock_code, market, stock_name, stock_type FROM stock_info"
     params = ()
     if stock_type is not None:
@@ -155,7 +183,6 @@ def get_kline(
     end: str = Query(None, description="结束时间 YYYY-MM-DD HH:MM"),
     limit: int = Query(1000, ge=1, le=10000),
 ):
-    """查询K线数据（原始不复权）"""
     market = 1 if stock_code.startswith(("6", "5")) else 0
     table = "kline_1min" if freq == "1min" else "kline_5min"
 
@@ -178,7 +205,6 @@ def get_kline(
 
 @app.get("/api/xdxr/{stock_code}")
 def get_xdxr(stock_code: str):
-    """查询除权除息事件"""
     market = 1 if stock_code.startswith(("6", "5")) else 0
     rows = fetchall(
         "SELECT * FROM xdxr_event WHERE stock_code=%s AND market=%s ORDER BY ex_date DESC",
@@ -189,7 +215,6 @@ def get_xdxr(stock_code: str):
 
 @app.get("/api/stats")
 def get_stats():
-    """数据库统计"""
     stats = {}
     for table in ["kline_1min", "kline_5min", "xdxr_event", "stock_info"]:
         row = fetchone(f"SELECT COUNT(*) as cnt FROM {table}")

@@ -1,12 +1,19 @@
 """
-全量同步 — 首次铺底
+全量同步 — 首次铺底 / 恢复续跑
 
-流程：
-1. 拉取全部A股列表并入库
-2. 拉取所有除权除息事件并入库
-3. 逐只股票拉取全量1min/5min数据并入库
-4. 全程记录同步日志，支持断点续传（跳过已同步的股票）
+支持阶段：
+- stock_list
+- xdxr
+- 5min
+- 1min
+
+设计目标：
+1. 可按阶段单独运行，兼容线上已有进度
+2. xdxr 若已在 sync_log 中成功完成过，则可跳过
+3. 5min / 1min 支持按股票续跑（基于最早时间判断是否已拉满）
 """
+
+from __future__ import annotations
 
 from datetime import datetime
 from src.fetcher.tdx_fetcher import TdxFetcher, FREQ_1MIN, FREQ_5MIN
@@ -14,28 +21,55 @@ from src.db import dao
 from src.utils.logger import logger
 
 
-def run_full_sync():
-    """执行全量铺底同步"""
+def run_full_sync(stage: str = "all"):
+    """
+    执行全量铺底同步。
+
+    stage:
+    - all: 全部阶段（自动跳过已完成 xdxr）
+    - stock_list
+    - xdxr
+    - 5min
+    - 1min
+    - resume: 等同 all，但语义上明确表示续跑
+    """
     logger.info("=" * 60)
-    logger.info("开始全量铺底同步")
+    logger.info(f"开始全量铺底同步, stage={stage}")
     logger.info("=" * 60)
 
     with TdxFetcher() as fetcher:
-        # Step 1: 同步股票列表
-        _sync_stock_list(fetcher)
+        # 股票列表在所有全量场景都先更新一次
+        if stage in ("all", "resume", "stock_list", "xdxr", "5min", "1min"):
+            _sync_stock_list(fetcher)
 
-        # Step 2: 获取已入库的股票列表
+        if stage == "stock_list":
+            logger.info("仅执行股票列表同步，结束")
+            return
+
         stocks = dao.get_all_stocks()
-        # 只同步股票（type=0），不同步指数和ETF的分钟数据量过大
         a_shares = [s for s in stocks if s["stock_type"] == 0]
         logger.info(f"待同步A股数量: {len(a_shares)}")
 
-        # Step 3: 同步除权除息事件
-        _sync_all_xdxr(fetcher, a_shares)
+        if stage in ("all", "resume", "xdxr"):
+            if dao.is_stage_completed("full", "xdxr") and stage in ("all", "resume"):
+                logger.info("检测到 xdxr 已成功完成过，本次跳过")
+            else:
+                _sync_all_xdxr(fetcher, a_shares)
+            if stage == "xdxr":
+                logger.info("仅执行 xdxr 同步，结束")
+                return
 
-        # Step 4: 逐只同步K线数据
-        _sync_all_kline(fetcher, a_shares, "kline_5min", FREQ_5MIN, "5min")
-        _sync_all_kline(fetcher, a_shares, "kline_1min", FREQ_1MIN, "1min")
+        if stage in ("all", "resume", "5min"):
+            _sync_all_kline(fetcher, a_shares, "kline_5min", FREQ_5MIN, "5min")
+            if stage == "5min":
+                logger.info("仅执行 5min 全量同步，结束")
+                return
+
+        if stage in ("all", "resume", "1min"):
+            _sync_all_kline(fetcher, a_shares, "kline_1min", FREQ_1MIN, "1min")
+            if stage == "1min":
+                logger.info("仅执行 1min 全量同步，结束")
+                return
 
     logger.info("=" * 60)
     logger.info("全量铺底同步完成")
@@ -76,8 +110,7 @@ def _sync_all_xdxr(fetcher: TdxFetcher, stocks: list[dict]):
         if (i + 1) % 500 == 0:
             logger.info(f"除权除息进度: {i + 1}/{len(stocks)}, 累计 {total_rows} 条")
 
-    status = "success" if failed == 0 else "success"  # 部分失败不影响整体
-    dao.finish_sync_log(log_id, total_rows, status)
+    dao.finish_sync_log(log_id, total_rows, "success")
     logger.info(f"除权除息同步完成: {total_rows} 条, 失败 {failed} 只")
 
 
@@ -92,7 +125,7 @@ def _sync_all_kline(
     逐只同步K线数据。
     断点续传逻辑：
     - 查该股票已有数据的最早时间(MIN(dt))
-    - 如果最早时间距今已超过阈值（5min>=650天），说明已拉满，跳过
+    - 如果最早时间距今已超过阈值（5min>=650天，1min>=90天），说明已拉满，跳过
     - 否则从offset=0重新拉全量，INSERT IGNORE去重
     （不能用记录数做offset，因为TDX服务器是滑动窗口，每天有新增有淘汰）
     """
@@ -102,32 +135,28 @@ def _sync_all_kline(
     skipped_count = 0
     failed_count = 0
 
-    # 5min服务器保留~700天，1min保留~100天，留些余量判断
-    from src.fetcher.tdx_fetcher import FREQ_5MIN
     days_threshold = 650 if frequency == FREQ_5MIN else 90
+    done_set = dao.get_completed_stock_set(table, days_threshold)
+    logger.info(f"[{label}] 已完成股票数: {len(done_set)}")
 
     for i, stock in enumerate(stocks):
         code, market = stock["stock_code"], stock["market"]
+        key = (code, market)
 
-        # 查最早数据时间，判断是否已拉满
-        oldest_dt = dao.get_oldest_dt(table, code, market)
-        if oldest_dt is not None:
-            days_back = (datetime.now() - oldest_dt).days
-            if days_back >= days_threshold:
-                skipped_count += 1
-                if (i + 1) % 500 == 0:
-                    logger.info(f"[{label}] 进度: {i + 1}/{len(stocks)}, 已同步 {synced_count}, 跳过 {skipped_count}")
-                continue
+        if key in done_set:
+            skipped_count += 1
+            if (i + 1) % 500 == 0:
+                logger.info(f"[{label}] 进度: {i + 1}/{len(stocks)}, 已同步 {synced_count}, 跳过 {skipped_count}")
+            continue
 
         try:
-            # 从offset=0拉全量，INSERT IGNORE处理与已有数据的重叠
             bars = fetcher.fetch_kline(frequency, market, code)
             if bars:
                 inserted = dao.batch_upsert_kline(table, bars)
                 total_rows += inserted
                 synced_count += 1
             else:
-                synced_count += 1  # 空数据（停牌股等）
+                synced_count += 1
         except Exception as e:
             failed_count += 1
             logger.warning(f"[{label}][{code}] K线同步失败: {e}")

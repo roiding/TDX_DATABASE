@@ -135,7 +135,54 @@ def get_oldest_dt(table: str, stock_code: str, market: int) -> datetime | None:
     return row["min_dt"] if row and row["min_dt"] else None
 
 
-# ---- 同步日志 ----
+
+
+def is_stage_completed(sync_type: str, data_type: str) -> bool:
+    """判断某个同步阶段是否已成功完成过"""
+    from src.db.connection import fetchone
+    row = fetchone(
+        """
+        SELECT id FROM sync_log
+        WHERE sync_type=%s AND data_type=%s AND status='success'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (sync_type, data_type),
+    )
+    return row is not None
+
+
+def get_latest_sync_log(sync_type: str, data_type: str) -> dict | None:
+    """获取某阶段最近一条同步日志"""
+    from src.db.connection import fetchone
+    return fetchone(
+        """
+        SELECT id, sync_type, data_type, stock_code, market, start_time, end_time,
+               rows_synced, status, error_msg
+        FROM sync_log
+        WHERE sync_type=%s AND data_type=%s
+        ORDER BY id DESC LIMIT 1
+        """,
+        (sync_type, data_type),
+    )
+
+
+def get_completed_stock_set(table: str, min_days_back: int) -> set[tuple[str, int]]:
+    """
+    一次性取出已完成全量铺底的股票集合。
+    条件：该股票最早数据距今达到阈值天数。
+    返回 {(stock_code, market), ...}
+    """
+    from src.db.connection import fetchall
+    rows = fetchall(
+        f"""
+        SELECT stock_code, market
+        FROM {table}
+        GROUP BY stock_code, market
+        HAVING DATEDIFF(NOW(), MIN(dt)) >= %s
+        """,
+        (min_days_back,),
+    )
+
 
 def create_sync_log(sync_type: str, data_type: str, stock_code: str = None, market: int = None) -> int:
     """创建一条同步日志，返回 log id"""
