@@ -185,12 +185,12 @@ class TdxFetcher:
     # K线数据
     # ============================================================
 
-    def fetch_kline(self, frequency, market, stock_code, max_pages=None, stop_before=None, start_offset=0) -> list[dict]:
+    def fetch_kline(self, frequency, market, stock_code, max_pages=None, stop_before=None) -> list[dict]:
         if max_pages is None:
             max_pages = self.max_pages
 
         all_bars = []
-        offset = start_offset
+        offset = 0
         should_stop = False
 
         for _ in range(max_pages):

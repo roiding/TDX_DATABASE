@@ -125,14 +125,14 @@ def get_latest_dt(table: str, stock_code: str, market: int) -> datetime | None:
     return row["max_dt"] if row and row["max_dt"] else None
 
 
-def get_record_count(table: str, stock_code: str, market: int) -> int:
-    """查询某只股票在某张K线表中的记录数"""
+def get_oldest_dt(table: str, stock_code: str, market: int) -> datetime | None:
+    """查询某只股票在某张K线表中的最早时间"""
     from src.db.connection import fetchone
     row = fetchone(
-        f"SELECT COUNT(*) as cnt FROM {table} WHERE stock_code=%s AND market=%s",
+        f"SELECT MIN(dt) as min_dt FROM {table} WHERE stock_code=%s AND market=%s",
         (stock_code, market),
     )
-    return row["cnt"] if row else 0
+    return row["min_dt"] if row and row["min_dt"] else None
 
 
 # ---- 同步日志 ----
