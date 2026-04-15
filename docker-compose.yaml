@@ -1,6 +1,12 @@
 services:
   tdx-sync:
     build: .
+    environment:
+      - MYSQL_HOST=your-cloud-mysql-host
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=your-password
+      - MYSQL_DATABASE=tdx_data
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs
