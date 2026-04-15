@@ -60,13 +60,18 @@ def _select_best_server_once():
 
 class TdxFetcher:
 
-    def __init__(self):
+    def __init__(self, mode: str = "daily"):
         cfg = get_config()
         sync_cfg = cfg.get("sync", {})
         self.batch_size = sync_cfg.get("batch_size", 800)
         self.max_pages = sync_cfg.get("max_pages", 50)
-        self.request_interval = sync_cfg.get("request_interval", 0.1)
         self.max_retries = sync_cfg.get("max_retries", 3)
+        self.mode = mode
+
+        if mode == "full":
+            self.request_interval = sync_cfg.get("full_request_interval", sync_cfg.get("request_interval", 0.1))
+        else:
+            self.request_interval = sync_cfg.get("daily_request_interval", sync_cfg.get("request_interval", 0.1))
 
         self._api = TdxHq_API()
         self._connected = False

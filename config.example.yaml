@@ -22,12 +22,23 @@ sync:
   batch_size: 800
   # 单只股票最大回溯页数（5min需约30页覆盖700天，1min需约22页覆盖100天）
   max_pages: 50
-  # API请求间隔（秒），避免被服务器限流
-  request_interval: 0.1
   # 失败重试次数
   max_retries: 3
   # 批量写入数据库的行数
   db_batch_size: 5000
+
+  # 全量铺底：更激进的吞吐配置
+  full_workers: 4
+  full_request_interval: 0.01
+
+  # 每日增量：更保守，稳定优先
+  daily_workers: 1
+  daily_request_interval: 0.1
+
+  # 兼容旧配置（如未拆分则回退使用）
+  request_interval: 0.1
+  workers: 1
+
   # 每日自动增量同步时间（24h制，工作日触发）
   daily_hour: 16
   daily_minute: 30

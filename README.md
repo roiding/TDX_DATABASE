@@ -62,6 +62,11 @@ curl http://localhost:8000/api/sync/status
 curl "http://localhost:8000/api/kline/600000?freq=5min&limit=10"
 ```
 
+双机并行建议：
+- 机器A：`/api/sync/full/5min`
+- 机器B：`/api/sync/full/1min`
+- 两台机器共享同一个 MySQL，即可并行铺底。
+
 ## 本地开发
 
 ```bash
