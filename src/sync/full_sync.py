@@ -9,6 +9,7 @@
 """
 
 from datetime import datetime
+from src.config import get_config
 from src.fetcher.tdx_fetcher import TdxFetcher, FREQ_1MIN, FREQ_5MIN
 from src.db import dao
 from src.utils.logger import logger
@@ -90,7 +91,8 @@ def _sync_all_kline(
 ):
     """
     逐只同步K线数据。
-    断点续传：如果该股票已有数据，则跳过（全量同步只做首次铺底）。
+    断点续传：查已有记录数作为offset起点，从断点继续往回翻页拉取更早的历史数据。
+    如果已有记录数已达到服务器上限（翻完所有页），则跳过。
     """
     log_id = dao.create_sync_log("full", label)
     total_rows = 0
@@ -98,23 +100,35 @@ def _sync_all_kline(
     skipped_count = 0
     failed_count = 0
 
+    # 服务器可用数据上限：max_pages * batch_size
+    cfg = get_config().get("sync", {})
+    max_bars = cfg.get("max_pages", 20) * cfg.get("batch_size", 800)
+
     for i, stock in enumerate(stocks):
         code, market = stock["stock_code"], stock["market"]
 
-        # 断点续传：已有数据则跳过
-        existing = dao.get_latest_dt(table, code, market)
-        if existing is not None:
+        # 查已有记录数
+        existing_count = dao.get_record_count(table, code, market)
+
+        # 记录数已达上限，说明之前已拉完，跳过
+        if existing_count >= max_bars:
             skipped_count += 1
             if (i + 1) % 500 == 0:
                 logger.info(f"[{label}] 进度: {i + 1}/{len(stocks)}, 已同步 {synced_count}, 跳过 {skipped_count}")
             continue
 
         try:
-            bars = fetcher.fetch_kline(frequency, market, code)
+            # 从已有记录数处继续往回翻页，INSERT IGNORE处理重叠部分
+            bars = fetcher.fetch_kline(frequency, market, code, start_offset=existing_count)
             if bars:
                 inserted = dao.batch_upsert_kline(table, bars)
                 total_rows += inserted
                 synced_count += 1
+            elif existing_count > 0:
+                # 没拿到新数据但已有部分数据，说明服务器数据到头了，也算完成
+                skipped_count += 1
+            else:
+                synced_count += 1  # 空数据（停牌股等）
         except Exception as e:
             failed_count += 1
             logger.warning(f"[{label}][{code}] K线同步失败: {e}")

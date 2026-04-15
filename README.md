@@ -1,14 +1,75 @@
 # TDX Database
 
-A股分钟级K线数据采集入库工具。从通达信行情服务器拉取 **1分钟** 和 **5分钟** 原始K线数据，存入MySQL，解决通达信本地数据保留期限问题（1分钟仅100天，5分钟仅700天）。
+A股分钟级K线数据采集入库服务。从通达信行情服务器拉取 **1分钟** 和 **5分钟** 原始K线数据，存入MySQL，解决通达信本地数据保留期限问题（1分钟仅100天，5分钟仅700天）。
 
 ## 核心设计
 
-- **只存原始不复权数据** — 除权除息事件独立存表，前复权/后复权由应用层按需计算，避免每次除权导致历史数据变动
-- **全量铺底 + 每日增量** — 首次拉取服务器全部可用历史，之后每天追加新数据
-- **断点续传** — 全量同步中断后重新执行会跳过已同步的股票
-- **幂等写入** — 重复执行不产生重复数据（INSERT IGNORE + ON DUPLICATE KEY UPDATE）
-- **按季度分区** — K线表按时间分区，兼顾查询效率和数据管理
+- **只存原始不复权数据** — 除权除息事件独立存表，复权因子由应用层按需计算
+- **Web 服务** — FastAPI 长驻服务，提供 REST API 查询数据、手动触发同步
+- **自动定时同步** — 每工作日收盘后自动增量同步（默认16:30）
+- **断点续传** — 全量同步中断后重启会从断点继续
+- **幂等写入** — 重复执行不产生重复数据
+
+## API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/stocks` | 股票列表 |
+| GET | `/api/kline/{code}?freq=5min&start=...&end=...&limit=1000` | K线查询 |
+| GET | `/api/xdxr/{code}` | 除权除息事件 |
+| GET | `/api/stats` | 数据库统计 |
+| POST | `/api/sync/full` | 触发全量铺底 |
+| POST | `/api/sync/daily` | 触发增量同步 |
+| GET | `/api/sync/status` | 同步状态 |
+| GET | `/docs` | Swagger 文档 |
+
+## Docker 部署
+
+```bash
+# docker-compose (推荐)
+docker compose up -d
+
+# 或直接 docker run
+docker run -d -p 8000:8000 \
+  -e MYSQL_HOST=xxx -e MYSQL_PORT=3306 \
+  -e MYSQL_USER=root -e MYSQL_PASSWORD=xxx \
+  -e MYSQL_DATABASE=tdx_data \
+  your-username/tdx-database:latest
+```
+
+启动后：
+```bash
+# 触发全量铺底（首次）
+curl -X POST http://localhost:8000/api/sync/full
+
+# 查看同步状态
+curl http://localhost:8000/api/sync/status
+
+# 查询数据
+curl "http://localhost:8000/api/kline/600000?freq=5min&limit=10"
+```
+
+## 本地开发
+
+```bash
+pip install -r requirements.txt
+cp config.example.yaml config.yaml  # 编辑填入MySQL连接信息
+python main.py
+```
+
+## 配置
+
+MySQL 连接：**环境变量 > config.yaml**
+
+| 环境变量 | 说明 |
+|---|---|
+| `MYSQL_HOST` | MySQL地址 |
+| `MYSQL_PORT` | MySQL端口 |
+| `MYSQL_USER` | 用户名 |
+| `MYSQL_PASSWORD` | 密码 |
+| `MYSQL_DATABASE` | 数据库名 |
+
+同步定时、请求间隔等参数见 `config.example.yaml`。
 
 ## 数据表
 
@@ -17,68 +78,9 @@ A股分钟级K线数据采集入库工具。从通达信行情服务器拉取 **
 | `stock_info` | 沪深A股基础信息 |
 | `kline_1min` | 1分钟K线（原始不复权），按季度分区 |
 | `kline_5min` | 5分钟K线（原始不复权），按季度分区 |
-| `xdxr_event` | 除权除息事件（分红、送股、配股等原始字段） |
+| `xdxr_event` | 除权除息事件 |
 | `sync_log` | 同步日志 |
-
-## 快速开始
-
-```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 准备配置（二选一）
-# 方式A: 配置文件
-cp config.example.yaml config.yaml
-# 编辑 config.yaml 填入 MySQL 连接信息
-
-# 方式B: 环境变量（Docker 部署推荐）
-export MYSQL_HOST=xxx MYSQL_PORT=3306 MYSQL_USER=root MYSQL_PASSWORD=xxx MYSQL_DATABASE=tdx_data
-
-# 云端 MySQL 建库
-# CREATE DATABASE tdx_data CHARACTER SET utf8mb4;
-
-# 初始化表结构
-python main.py init
-
-# 全量铺底（首次，约1-2小时）
-python main.py full
-
-# 每日增量（收盘后执行）
-python main.py daily
-
-# 查看同步状态
-python main.py status
-
-# 查询数据（调试）
-python main.py query 000001 -f 5min -n 10
-```
-
-## Docker 部署
-
-```bash
-# 全量铺底
-docker compose run tdx-sync full
-
-# 每日增量
-docker compose up
-```
-
-MySQL 连接信息在 `docker-compose.yaml` 的 `environment` 中配置。
-
-## 配置优先级
-
-MySQL 连接信息：**环境变量 > config.yaml**
-
-| 环境变量 | 对应配置 |
-|---|---|
-| `MYSQL_HOST` | mysql.host |
-| `MYSQL_PORT` | mysql.port |
-| `MYSQL_USER` | mysql.user |
-| `MYSQL_PASSWORD` | mysql.password |
-| `MYSQL_DATABASE` | mysql.database |
 
 ## 技术栈
 
-- **数据源**: pytdx（通达信行情服务器协议）
-- **数据库**: MySQL（云端），按季度分区
-- **语言**: Python 3.9+
+Python 3.9+ / FastAPI / pytdx + mootdx / MySQL / Docker (amd64 + arm64)

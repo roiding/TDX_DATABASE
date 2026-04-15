@@ -2,6 +2,7 @@
 数据访问层 — 批量写入K线、除权除息、同步日志
 使用 INSERT IGNORE 天然去重（联合主键冲突时跳过）
 """
+from __future__ import annotations
 
 from datetime import datetime
 from src.db.connection import get_conn
@@ -122,6 +123,16 @@ def get_latest_dt(table: str, stock_code: str, market: int) -> datetime | None:
         (stock_code, market),
     )
     return row["max_dt"] if row and row["max_dt"] else None
+
+
+def get_record_count(table: str, stock_code: str, market: int) -> int:
+    """查询某只股票在某张K线表中的记录数"""
+    from src.db.connection import fetchone
+    row = fetchone(
+        f"SELECT COUNT(*) as cnt FROM {table} WHERE stock_code=%s AND market=%s",
+        (stock_code, market),
+    )
+    return row["cnt"] if row else 0
 
 
 # ---- 同步日志 ----

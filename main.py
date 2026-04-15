@@ -1,117 +1,200 @@
 """
-TDX Database — 主入口
+TDX Database — Web 服务入口
 
-用法:
-    python main.py init         初始化数据库表
-    python main.py full         全量铺底同步（首次使用）
-    python main.py daily        每日增量同步
-    python main.py status       查看同步状态
+启动即为长驻服务：
+- 自动建表
+- 定时每日增量同步（默认16:30）
+- 提供 REST API 查询数据、手动触发同步
 """
 
 import sys
-import click
+import threading
 from pathlib import Path
+from contextlib import asynccontextmanager
 
-# 确保项目根目录在 sys.path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.config import load_config
+from fastapi import FastAPI, Query, HTTPException
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from src.config import load_config, get_config
 from src.utils.logger import setup_logger, logger
+from src.db.schema import init_database
+from src.db.connection import fetchall, fetchone
 
 
-@click.group()
-@click.option("--config", "-c", default="config.yaml", help="配置文件路径")
-def cli(config):
-    """TDX 股票分钟数据采集入库工具"""
-    load_config(config)
+# ============================================================
+# 全局状态
+# ============================================================
+_sync_lock = threading.Lock()
+_sync_status = {"running": False, "type": None, "message": "idle"}
+
+
+def _run_sync(sync_type: str):
+    """在后台线程中执行同步，防止并发"""
+    if not _sync_lock.acquire(blocking=False):
+        logger.warning(f"同步任务已在运行，跳过本次 {sync_type}")
+        return
+    try:
+        _sync_status.update(running=True, type=sync_type, message="running")
+        if sync_type == "full":
+            from src.sync.full_sync import run_full_sync
+            run_full_sync()
+        else:
+            from src.sync.daily_sync import run_daily_sync
+            run_daily_sync()
+        _sync_status.update(running=False, type=None, message=f"last {sync_type} finished")
+    except Exception as e:
+        logger.error(f"同步异常: {e}")
+        _sync_status.update(running=False, type=None, message=f"error: {e}")
+    finally:
+        _sync_lock.release()
+
+
+# ============================================================
+# App 生命周期
+# ============================================================
+scheduler = BackgroundScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_config()
     setup_logger()
 
-
-@cli.command()
-def init():
-    """初始化数据库（建表）"""
-    from src.db.schema import init_database
+    # 自动建表
     init_database()
-    click.echo("数据库初始化完成")
+
+    # 定时每日增量：工作日 16:30
+    sync_cfg = get_config().get("sync", {})
+    cron_hour = sync_cfg.get("daily_hour", 16)
+    cron_minute = sync_cfg.get("daily_minute", 30)
+    scheduler.add_job(
+        lambda: _run_sync("daily"),
+        "cron",
+        hour=cron_hour, minute=cron_minute,
+        day_of_week="mon-fri",
+        id="daily_sync",
+    )
+    scheduler.start()
+    logger.info(f"定时任务已启动: 每工作日 {cron_hour}:{cron_minute:02d} 增量同步")
+
+    yield
+
+    scheduler.shutdown()
 
 
-@cli.command()
-def full():
-    """全量铺底同步（首次使用）"""
-    from src.sync.full_sync import run_full_sync
-    click.echo("开始全量铺底同步，预计需要较长时间...")
-    run_full_sync()
-    click.echo("全量铺底同步完成")
+app = FastAPI(title="TDX Database", lifespan=lifespan)
 
 
-@cli.command()
-def daily():
-    """每日增量同步"""
-    from src.sync.daily_sync import run_daily_sync
-    click.echo("开始每日增量同步...")
-    run_daily_sync()
-    click.echo("每日增量同步完成")
+# ============================================================
+# 同步控制 API
+# ============================================================
+
+@app.post("/api/sync/full")
+def trigger_full_sync():
+    """手动触发全量铺底"""
+    if _sync_status["running"]:
+        raise HTTPException(409, f"同步任务正在运行: {_sync_status['type']}")
+    threading.Thread(target=_run_sync, args=("full",), daemon=True).start()
+    return {"message": "全量同步已启动"}
 
 
-@cli.command()
-def status():
-    """查看最近的同步记录"""
-    from src.db.connection import fetchall
-    rows = fetchall("""
+@app.post("/api/sync/daily")
+def trigger_daily_sync():
+    """手动触发每日增量"""
+    if _sync_status["running"]:
+        raise HTTPException(409, f"同步任务正在运行: {_sync_status['type']}")
+    threading.Thread(target=_run_sync, args=("daily",), daemon=True).start()
+    return {"message": "增量同步已启动"}
+
+
+@app.get("/api/sync/status")
+def sync_status():
+    """查询同步状态 + 最近同步记录"""
+    logs = fetchall("""
         SELECT id, sync_type, data_type, stock_code, start_time, end_time,
                rows_synced, status, error_msg
-        FROM sync_log
-        ORDER BY id DESC
-        LIMIT 20
+        FROM sync_log ORDER BY id DESC LIMIT 10
     """)
-    if not rows:
-        click.echo("暂无同步记录")
-        return
-
-    click.echo(f"{'ID':>5} {'类型':<8} {'数据':<8} {'股票':<8} {'状态':<8} {'行数':>10} {'开始时间':<20} {'耗时'}")
-    click.echo("-" * 90)
-    for r in rows:
-        elapsed = ""
-        if r["end_time"] and r["start_time"]:
-            delta = r["end_time"] - r["start_time"]
-            elapsed = str(delta).split(".")[0]
-        click.echo(
-            f"{r['id']:>5} {r['sync_type']:<8} {r['data_type']:<8} "
-            f"{r['stock_code'] or 'ALL':<8} {r['status']:<8} {r['rows_synced']:>10} "
-            f"{str(r['start_time'])[:19]:<20} {elapsed}"
-        )
+    return {
+        "current": _sync_status,
+        "recent_logs": logs,
+    }
 
 
-@cli.command()
-@click.argument("stock_code")
-@click.option("--market", "-m", type=int, default=None, help="市场: 0=深圳, 1=上海（自动识别）")
-@click.option("--freq", "-f", type=click.Choice(["1min", "5min"]), default="5min", help="K线周期")
-@click.option("--limit", "-n", type=int, default=20, help="显示条数")
-def query(stock_code, market, freq, limit):
-    """查询某只股票的K线数据（调试用）"""
-    from src.db.connection import fetchall
+# ============================================================
+# 数据查询 API
+# ============================================================
 
-    if market is None:
-        market = 1 if stock_code.startswith(("6", "5")) else 0
+@app.get("/api/stocks")
+def list_stocks(stock_type: int = None):
+    """获取股票列表。stock_type: 0=股票, 1=指数, 2=ETF"""
+    sql = "SELECT stock_code, market, stock_name, stock_type FROM stock_info"
+    params = ()
+    if stock_type is not None:
+        sql += " WHERE stock_type=%s"
+        params = (stock_type,)
+    sql += " ORDER BY market, stock_code"
+    return fetchall(sql, params)
 
+
+@app.get("/api/kline/{stock_code}")
+def get_kline(
+    stock_code: str,
+    freq: str = Query("5min", regex="^(1min|5min)$"),
+    start: str = Query(None, description="开始时间 YYYY-MM-DD HH:MM"),
+    end: str = Query(None, description="结束时间 YYYY-MM-DD HH:MM"),
+    limit: int = Query(1000, ge=1, le=10000),
+):
+    """查询K线数据（原始不复权）"""
+    market = 1 if stock_code.startswith(("6", "5")) else 0
     table = "kline_1min" if freq == "1min" else "kline_5min"
+
+    conditions = ["stock_code=%s", "market=%s"]
+    params = [stock_code, market]
+
+    if start:
+        conditions.append("dt>=%s")
+        params.append(start)
+    if end:
+        conditions.append("dt<=%s")
+        params.append(end)
+
+    sql = f"SELECT dt, open, high, low, close, volume, amount FROM {table} WHERE {' AND '.join(conditions)} ORDER BY dt DESC LIMIT %s"
+    params.append(limit)
+
+    rows = fetchall(sql, tuple(params))
+    return {"stock_code": stock_code, "freq": freq, "count": len(rows), "data": rows}
+
+
+@app.get("/api/xdxr/{stock_code}")
+def get_xdxr(stock_code: str):
+    """查询除权除息事件"""
+    market = 1 if stock_code.startswith(("6", "5")) else 0
     rows = fetchall(
-        f"SELECT * FROM {table} WHERE stock_code=%s AND market=%s ORDER BY dt DESC LIMIT %s",
-        (stock_code, market, limit),
+        "SELECT * FROM xdxr_event WHERE stock_code=%s AND market=%s ORDER BY ex_date DESC",
+        (stock_code, market),
     )
+    return {"stock_code": stock_code, "count": len(rows), "data": rows}
 
-    if not rows:
-        click.echo(f"无数据: {stock_code} ({freq})")
-        return
 
-    click.echo(f"{'时间':<20} {'开盘':>10} {'最高':>10} {'最低':>10} {'收盘':>10} {'成交量':>12} {'成交额':>14}")
-    click.echo("-" * 100)
-    for r in rows:
-        click.echo(
-            f"{str(r['dt']):<20} {r['open']:>10.3f} {r['high']:>10.3f} "
-            f"{r['low']:>10.3f} {r['close']:>10.3f} {r['volume']:>12} {r['amount']:>14.2f}"
-        )
+@app.get("/api/stats")
+def get_stats():
+    """数据库统计"""
+    stats = {}
+    for table in ["kline_1min", "kline_5min", "xdxr_event", "stock_info"]:
+        row = fetchone(f"SELECT COUNT(*) as cnt FROM {table}")
+        stats[table] = row["cnt"] if row else 0
+
+    for table in ["kline_1min", "kline_5min"]:
+        row = fetchone(f"SELECT MIN(dt) as min_dt, MAX(dt) as max_dt FROM {table}")
+        if row and row["min_dt"]:
+            stats[f"{table}_range"] = f"{row['min_dt']} ~ {row['max_dt']}"
+
+    return stats
 
 
 if __name__ == "__main__":
-    cli()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

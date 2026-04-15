@@ -8,6 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY main.py .
 
-# 默认执行每日增量同步，可通过 docker run 覆盖命令
-ENTRYPOINT ["python", "main.py"]
-CMD ["daily"]
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

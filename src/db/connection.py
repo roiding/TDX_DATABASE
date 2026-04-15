@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pymysql
 from dbutils.pooled_db import PooledDB
 from src.config import get_config

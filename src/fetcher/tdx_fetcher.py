@@ -1,21 +1,22 @@
-"""
-TDX 行情数据获取器
+from __future__ import annotations
 
-基于 pytdx 封装，提供：
-- 多服务器自动 failover
-- 请求重试
-- 分页拉取所有历史K线
-- 除权除息数据获取
-- 股票列表获取
+"""
+TDX 数据获取器
+
+- 股票列表: mootdx (stock_all，完整可靠)
+- K线数据/除权除息: pytdx 协议直连行情服务器
+- 服务器自动选优: 从 pytdx 内置列表中选延迟最低的
 """
 
 import time
 from datetime import datetime
+
 from pytdx.hq import TdxHq_API
+from pytdx.config.hosts import hq_hosts
+
 from src.config import get_config
 from src.utils.logger import logger
 
-# pytdx K线周期常量
 FREQ_5MIN = 0
 FREQ_1MIN = 8
 
@@ -24,36 +25,67 @@ class TdxFetcher:
 
     def __init__(self):
         cfg = get_config()
-        self.servers = cfg.get("tdx_servers", [{"host": "119.147.212.81", "port": 7709}])
         sync_cfg = cfg.get("sync", {})
         self.batch_size = sync_cfg.get("batch_size", 800)
-        self.max_pages = sync_cfg.get("max_pages", 20)
+        self.max_pages = sync_cfg.get("max_pages", 50)
         self.request_interval = sync_cfg.get("request_interval", 0.1)
         self.max_retries = sync_cfg.get("max_retries", 3)
 
         self._api = TdxHq_API()
         self._connected = False
-        self._current_server_idx = 0
+        self._best_server = None
 
     # ============================================================
     # 连接管理
     # ============================================================
 
-    def connect(self) -> bool:
-        """尝试连接，自动遍历服务器列表"""
-        for i, server in enumerate(self.servers):
+    def _select_best_server(self):
+        logger.info(f"正在从 {len(hq_hosts)} 台服务器中自动选优...")
+        best = None
+        best_time = float("inf")
+
+        for name, host, port in hq_hosts:
             try:
-                result = self._api.connect(server["host"], server["port"])
-                if result:
-                    self._connected = True
-                    self._current_server_idx = i
-                    logger.info(f"已连接 TDX 服务器: {server['host']}:{server['port']}")
-                    return True
-            except Exception as e:
-                logger.warning(f"连接 {server['host']}:{server['port']} 失败: {e}")
+                start = time.time()
+                r = self._api.connect(host, port, time_out=3)
+                elapsed = time.time() - start
+                if r:
+                    self._api.disconnect()
+                    if elapsed < best_time:
+                        best = (host, port, name)
+                        best_time = elapsed
+                    if elapsed < 0.05:
+                        break
+            except Exception:
                 continue
 
-        logger.error("所有 TDX 服务器均连接失败")
+        if best:
+            logger.info(f"选优完成: {best[2]} ({best[0]}:{best[1]}) 延迟 {best_time*1000:.0f}ms")
+        return best
+
+    def connect(self) -> bool:
+        if self._best_server:
+            host, port, name = self._best_server
+            try:
+                if self._api.connect(host, port, time_out=5):
+                    self._connected = True
+                    return True
+            except Exception:
+                self._best_server = None
+
+        self._best_server = self._select_best_server()
+        if not self._best_server:
+            logger.error("所有 TDX 服务器均连接失败")
+            return False
+
+        host, port, name = self._best_server
+        try:
+            if self._api.connect(host, port, time_out=5):
+                self._connected = True
+                logger.info(f"已连接: {name} ({host}:{port})")
+                return True
+        except Exception as e:
+            logger.error(f"连接失败: {e}")
         return False
 
     def disconnect(self):
@@ -70,7 +102,6 @@ class TdxFetcher:
                 raise ConnectionError("无法连接 TDX 服务器")
 
     def _retry_on_failure(self, func, *args, **kwargs):
-        """带重试和自动重连的调用封装"""
         for attempt in range(self.max_retries):
             try:
                 self._ensure_connected()
@@ -88,89 +119,78 @@ class TdxFetcher:
                     raise
 
     # ============================================================
-    # 股票列表
+    # 股票列表 (mootdx)
     # ============================================================
 
     def fetch_stock_list(self) -> list[dict]:
-        """
-        获取沪深两市全部证券列表，过滤出A股。
-        返回: [{'stock_code', 'market', 'stock_name', 'stock_type'}, ...]
-        """
-        all_stocks = []
+        """通过 mootdx 获取沪深全部证券列表，过滤出A股"""
+        from mootdx.quotes import Quotes
 
-        for market in [0, 1]:  # 0=深圳, 1=上海
-            start = 0
-            while True:
-                data = self._retry_on_failure(self._api.get_security_list, market, start)
-                if not data:
-                    break
-                for item in data:
-                    code = item["code"]
-                    stock_type = self._classify_stock(code, market)
-                    if stock_type is not None:
-                        all_stocks.append({
-                            "stock_code": code,
-                            "market": market,
-                            "stock_name": item.get("name", ""),
-                            "stock_type": stock_type,
-                        })
-                start += len(data)
+        # 复用已选优的服务器
+        if self._best_server:
+            host, port, _ = self._best_server
+            server = (host, port)
+        else:
+            server = None
 
-        logger.info(f"获取到 {len(all_stocks)} 只A股证券")
-        return all_stocks
+        client = Quotes.factory(market="std", server=server, timeout=15)
+
+        stocks = []
+        for market in [0, 1]:
+            label = "深圳" if market == 0 else "上海"
+            df = client.stocks(market=market)
+            logger.info(f"{label} 获取到 {len(df)} 条证券")
+
+            for _, row in df.iterrows():
+                code = str(row["code"])
+                name = str(row.get("name", ""))
+                stock_type = self._classify_stock(code, market)
+                if stock_type is not None:
+                    stocks.append({
+                        "stock_code": code,
+                        "market": market,
+                        "stock_name": name,
+                        "stock_type": stock_type,
+                    })
+
+        client.close()
+        logger.info(f"过滤后 A股证券: {len(stocks)} 只")
+        return stocks
 
     @staticmethod
     def _classify_stock(code: str, market: int) -> int | None:
-        """
-        根据代码前缀分类证券类型。
-        返回: 0=股票, 1=指数, 2=ETF, None=不纳入
-        """
+        """0=股票, 1=指数, 2=ETF, None=不纳入"""
         if market == 0:  # 深圳
             if code.startswith(("000", "001", "002", "003", "300", "301")):
-                return 0  # A股
+                return 0
+            if code.startswith(("430", "830", "831", "832", "833", "834", "835",
+                                "836", "837", "838", "839", "870", "871", "872",
+                                "873", "920")):
+                return 0  # 北交所
             if code.startswith("399"):
-                return 1  # 指数
-            if code.startswith(("159",)):
-                return 2  # ETF
+                return 1
+            if code.startswith("159"):
+                return 2
         elif market == 1:  # 上海
             if code.startswith(("600", "601", "603", "605", "688", "689")):
-                return 0  # A股
+                return 0
             if code.startswith(("000", "880")):
-                return 1  # 指数
-            if code.startswith(("510", "511", "512", "513", "515", "516", "518", "560", "561", "562", "563", "588")):
-                return 2  # ETF
-        return None  # 不纳入（B股、债券、权证等）
+                return 1
+            if code.startswith(("510", "511", "512", "513", "515", "516", "518",
+                                "560", "561", "562", "563", "588")):
+                return 2
+        return None
 
     # ============================================================
     # K线数据
     # ============================================================
 
-    def fetch_kline(
-        self,
-        frequency: int,
-        market: int,
-        stock_code: str,
-        max_pages: int = None,
-        stop_before: datetime = None,
-    ) -> list[dict]:
-        """
-        分页拉取K线数据（从最新往回翻页）。
-
-        Args:
-            frequency: FREQ_1MIN 或 FREQ_5MIN
-            market: 0=深圳, 1=上海
-            stock_code: 股票代码
-            max_pages: 最大翻页次数，None则使用默认值
-            stop_before: 遇到此时间之前的数据则停止（用于增量同步）
-
-        Returns:
-            list of dict, 按时间升序
-        """
+    def fetch_kline(self, frequency, market, stock_code, max_pages=None, stop_before=None, start_offset=0) -> list[dict]:
         if max_pages is None:
             max_pages = self.max_pages
 
         all_bars = []
-        offset = 0
+        offset = start_offset
         should_stop = False
 
         for _ in range(max_pages):
@@ -184,8 +204,6 @@ class TdxFetcher:
                 dt = self._parse_bar_datetime(bar)
                 if dt is None:
                     continue
-
-                # 增量模式：遇到已有数据则停止
                 if stop_before and dt <= stop_before:
                     should_stop = True
                     continue
@@ -204,16 +222,13 @@ class TdxFetcher:
 
             if should_stop or len(data) < self.batch_size:
                 break
-
             offset += self.batch_size
 
-        # 按时间升序排列
         all_bars.sort(key=lambda x: x["dt"])
         return all_bars
 
     @staticmethod
     def _parse_bar_datetime(bar: dict) -> datetime | None:
-        """解析 pytdx 返回的K线时间"""
         try:
             dt_str = bar.get("datetime", "")
             if not dt_str:
@@ -226,11 +241,7 @@ class TdxFetcher:
     # 除权除息
     # ============================================================
 
-    def fetch_xdxr(self, market: int, stock_code: str) -> list[dict]:
-        """
-        获取除权除息事件数据。
-        返回: [{'stock_code', 'market', 'ex_date', 'category', 'fenhong', ...}, ...]
-        """
+    def fetch_xdxr(self, market, stock_code) -> list[dict]:
         data = self._retry_on_failure(self._api.get_xdxr_info, market, stock_code)
         if not data:
             return []
@@ -256,7 +267,6 @@ class TdxFetcher:
                 })
             except (KeyError, TypeError):
                 continue
-
         return rows
 
     # ============================================================
