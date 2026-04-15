@@ -30,8 +30,16 @@ _sync_lock = threading.Lock()
 _sync_status = {"running": False, "type": None, "message": "idle"}
 
 
-def _run_sync(sync_type: str):
+def _run_sync(sync_type: str, check_trading_day: bool = False):
     """在后台线程中执行同步，防止并发"""
+    if check_trading_day:
+        from datetime import date
+        from chinese_calendar import is_holiday
+        today = date.today()
+        if today.weekday() >= 5 or is_holiday(today):
+            logger.info(f"今日非交易日，跳过 {sync_type} 同步")
+            return
+
     if not _sync_lock.acquire(blocking=False):
         logger.warning(f"同步任务已在运行，跳过本次 {sync_type}")
         return
@@ -70,7 +78,7 @@ async def lifespan(app: FastAPI):
     cron_hour = sync_cfg.get("daily_hour", 16)
     cron_minute = sync_cfg.get("daily_minute", 30)
     scheduler.add_job(
-        lambda: _run_sync("daily"),
+        lambda: _run_sync("daily", check_trading_day=True),
         "cron",
         hour=cron_hour, minute=cron_minute,
         day_of_week="mon-fri",

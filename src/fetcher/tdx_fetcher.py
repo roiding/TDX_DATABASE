@@ -12,13 +12,50 @@ import time
 from datetime import datetime
 
 from pytdx.hq import TdxHq_API
-from pytdx.config.hosts import hq_hosts
 
 from src.config import get_config
 from src.utils.logger import logger
 
 FREQ_5MIN = 0
 FREQ_1MIN = 8
+
+# 模块级缓存：选优结果只做一次，进程内复用
+_cached_best_server = None
+
+
+def _select_best_server_once():
+    """首次调用时从 pytdx 内置列表中选最快服务器，之后复用缓存"""
+    global _cached_best_server
+    if _cached_best_server is not None:
+        return _cached_best_server
+
+    from pytdx.config.hosts import hq_hosts
+    api = TdxHq_API()
+    logger.info(f"正在从 {len(hq_hosts)} 台服务器中自动选优（仅首次）...")
+    best = None
+    best_time = float("inf")
+
+    for name, host, port in hq_hosts:
+        try:
+            start = time.time()
+            r = api.connect(host, port, time_out=3)
+            elapsed = time.time() - start
+            if r:
+                api.disconnect()
+                if elapsed < best_time:
+                    best = (host, port, name)
+                    best_time = elapsed
+                if elapsed < 0.05:
+                    break
+        except Exception:
+            continue
+
+    if best:
+        logger.info(f"选优完成: {best[2]} ({best[0]}:{best[1]}) 延迟 {best_time*1000:.0f}ms")
+        _cached_best_server = best
+    else:
+        logger.error("所有 TDX 服务器均连接失败")
+    return best
 
 
 class TdxFetcher:
@@ -33,52 +70,34 @@ class TdxFetcher:
 
         self._api = TdxHq_API()
         self._connected = False
-        self._best_server = None
 
     # ============================================================
     # 连接管理
     # ============================================================
 
-    def _select_best_server(self):
-        logger.info(f"正在从 {len(hq_hosts)} 台服务器中自动选优...")
-        best = None
-        best_time = float("inf")
-
-        for name, host, port in hq_hosts:
-            try:
-                start = time.time()
-                r = self._api.connect(host, port, time_out=3)
-                elapsed = time.time() - start
-                if r:
-                    self._api.disconnect()
-                    if elapsed < best_time:
-                        best = (host, port, name)
-                        best_time = elapsed
-                    if elapsed < 0.05:
-                        break
-            except Exception:
-                continue
-
-        if best:
-            logger.info(f"选优完成: {best[2]} ({best[0]}:{best[1]}) 延迟 {best_time*1000:.0f}ms")
-        return best
-
     def connect(self) -> bool:
-        if self._best_server:
-            host, port, name = self._best_server
-            try:
-                if self._api.connect(host, port, time_out=5):
-                    self._connected = True
-                    return True
-            except Exception:
-                self._best_server = None
-
-        self._best_server = self._select_best_server()
-        if not self._best_server:
-            logger.error("所有 TDX 服务器均连接失败")
+        server = _select_best_server_once()
+        if not server:
             return False
 
-        host, port, name = self._best_server
+        host, port, name = server
+        try:
+            if self._api.connect(host, port, time_out=5):
+                self._connected = True
+                logger.info(f"已连接: {name} ({host}:{port})")
+                return True
+        except Exception:
+            pass
+
+        # 缓存的服务器失效，清除缓存重新选优
+        global _cached_best_server
+        _cached_best_server = None
+        logger.warning("缓存服务器失效，重新选优")
+        server = _select_best_server_once()
+        if not server:
+            return False
+
+        host, port, name = server
         try:
             if self._api.connect(host, port, time_out=5):
                 self._connected = True
@@ -127,13 +146,14 @@ class TdxFetcher:
         from mootdx.quotes import Quotes
 
         # 复用已选优的服务器
-        if self._best_server:
-            host, port, _ = self._best_server
-            server = (host, port)
+        server = _select_best_server_once()
+        if server:
+            host, port, _ = server
+            srv = (host, port)
         else:
-            server = None
+            srv = None
 
-        client = Quotes.factory(market="std", server=server, timeout=15)
+        client = Quotes.factory(market="std", server=srv, timeout=15)
 
         stocks = []
         for market in [0, 1]:
