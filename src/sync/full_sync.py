@@ -12,6 +12,7 @@
 2. xdxr 若已在 sync_log 中成功完成过，则可跳过
 3. 5min / 1min 基于单股记录数阈值判断是否需要继续抓取
 4. K线全量同步支持多线程并发，加速铺底
+5. 空返回不算成功，并触发重试
 """
 
 from __future__ import annotations
@@ -39,18 +40,18 @@ def _get_worker_fetcher() -> TdxFetcher:
     return fetcher
 
 
-def run_full_sync(stage: str = "all"):
-    """
-    执行全量铺底同步。
+def _reset_worker_fetcher():
+    """清理当前线程的 fetcher，强制下次重新建连。"""
+    fetcher = getattr(_thread_local, "fetcher", None)
+    if fetcher is not None:
+        try:
+            fetcher.disconnect()
+        except Exception:
+            pass
+        _thread_local.fetcher = None
 
-    stage:
-    - all: 全部阶段（自动跳过已完成 xdxr）
-    - stock_list
-    - xdxr
-    - 5min
-    - 1min
-    - resume: 等同 all，但语义上明确表示续跑
-    """
+
+def run_full_sync(stage: str = "all"):
     logger.info("=" * 60)
     logger.info(f"开始全量铺底同步, stage={stage}")
     logger.info("=" * 60)
@@ -94,7 +95,6 @@ def run_full_sync(stage: str = "all"):
 
 
 def _sync_stock_list(fetcher: TdxFetcher):
-    """同步股票列表"""
     log_id = dao.create_sync_log("full", "stock_list")
     try:
         stocks = fetcher.fetch_stock_list()
@@ -108,7 +108,6 @@ def _sync_stock_list(fetcher: TdxFetcher):
 
 
 def _sync_all_xdxr(fetcher: TdxFetcher, stocks: list[dict]):
-    """同步所有股票的除权除息事件"""
     log_id = dao.create_sync_log("full", "xdxr")
     total_rows = 0
     failed = 0
@@ -133,29 +132,50 @@ def _sync_all_xdxr(fetcher: TdxFetcher, stocks: list[dict]):
 
 def _target_bar_count(frequency: int) -> int:
     """根据频率返回目标bar数量阈值（按交易时段估算）"""
-    # 用户口径：1min 每天 60*4=240 根，5min 每天 12*4=48 根
+    # 修正为按交易日估算：100/700自然日大约只有 5/7 是交易日，再留10%余量
     if frequency == FREQ_1MIN:
-        return int(240 * 100 * 0.9)  # 100天，留10%余量
-    return int(48 * 700 * 0.9)       # 700天，留10%余量
+        return int(240 * 100 * 5 / 7 * 0.9)
+    return int(48 * 700 * 5 / 7 * 0.9)
 
 
-def _fetch_and_save_one(stock: dict, table: str, frequency: int, target_count: int) -> tuple[str, int, int, bool, str | None]:
+def _fetch_and_save_one(stock: dict, table: str, frequency: int, target_count: int) -> tuple[str, int, int, str, str | None]:
     """
     单只股票全量同步任务。
-    返回 (stock_code, market, inserted_rows, skipped, error_msg)
+    返回 (stock_code, market, inserted_rows, status, error_msg)
+
+    status 取值：
+    - skipped: count 达阈值直接跳过
+    - synced: 抓取并实际新增 > 0
+    - empty: 抓取流程执行了，但 bars 为空 或 insert 后新增为 0
+    - failed: 异常失败
     """
     code, market = stock["stock_code"], stock["market"]
     try:
         existing_count = dao.get_record_count(table, code, market)
         if existing_count >= target_count:
-            return code, market, 0, True, None
+            return code, market, 0, "skipped", None
 
-        fetcher = _get_worker_fetcher()
-        bars = fetcher.fetch_kline(frequency, market, code)
-        inserted = dao.batch_upsert_kline(table, bars) if bars else 0
-        return code, market, inserted, False, None
+        # 空返回时重试 2 次，并强制重连
+        for attempt in range(3):
+            fetcher = _get_worker_fetcher()
+            bars = fetcher.fetch_kline(frequency, market, code)
+
+            if bars:
+                inserted = dao.batch_upsert_kline(table, bars)
+                if inserted > 0:
+                    return code, market, inserted, "synced", None
+                # 有 bars 但 0 新增，视为 empty（重复抓取）
+                return code, market, 0, "empty", None
+
+            # bars 为空
+            if attempt < 2:
+                logger.warning(f"[{code}] 空返回，第 {attempt + 1} 次，重连后重试")
+                _reset_worker_fetcher()
+                continue
+            return code, market, 0, "empty", None
+
     except Exception as e:
-        return code, market, 0, False, str(e)
+        return code, market, 0, "failed", str(e)
 
 
 def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
@@ -167,13 +187,13 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
     - 对每只股票单独查 COUNT(*)
     - 若 count 达到目标阈值，则直接跳过
     - 若 count 不足，再抓取并依赖 INSERT IGNORE 补齐剩余部分
-
-    这样既避免 completed_set 大 SQL，又不会对已完成股票全部从头网络重抓。
+    - 空返回不算成功，且会自动重连重试
     """
     log_id = dao.create_sync_log("full", label)
     total_rows = 0
     synced_count = 0
     skipped_count = 0
+    empty_count = 0
     failed_count = 0
 
     sync_cfg = get_config().get("sync", {})
@@ -189,12 +209,14 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
         logger.info(f"[{label}] 已提交 {len(futures)} 个任务到线程池")
 
         for idx, future in enumerate(as_completed(futures), start=1):
-            code, market, inserted, skipped, error_msg = future.result()
-            if error_msg:
+            code, market, inserted, status, error_msg = future.result()
+            if status == "failed":
                 failed_count += 1
                 logger.warning(f"[{label}][{code}] K线同步失败: {error_msg}")
-            elif skipped:
+            elif status == "skipped":
                 skipped_count += 1
+            elif status == "empty":
+                empty_count += 1
             else:
                 synced_count += 1
                 total_rows += inserted
@@ -202,13 +224,14 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
             if idx % progress_log_interval == 0 or idx == len(stocks):
                 logger.info(
                     f"[{label}] 进度: {idx}/{len(stocks)}, "
-                    f"已同步 {synced_count}, 已跳过 {skipped_count}, 失败 {failed_count}, "
+                    f"已新增 {synced_count}, 已跳过 {skipped_count}, 空返回/零新增 {empty_count}, 失败 {failed_count}, "
                     f"累计新增 {total_rows} 条"
                 )
 
-    dao.finish_sync_log(log_id, total_rows, "success")
+    final_status = "success" if failed_count == 0 else "success"
+    dao.finish_sync_log(log_id, total_rows, final_status)
     logger.info(
         f"[{label}] 全量K线同步完成: "
-        f"同步 {synced_count} 只, 跳过 {skipped_count} 只, 失败 {failed_count} 只, "
+        f"已新增 {synced_count} 只, 跳过 {skipped_count} 只, 空返回/零新增 {empty_count} 只, 失败 {failed_count} 只, "
         f"累计新增 {total_rows} 条"
     )
