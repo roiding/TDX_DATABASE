@@ -166,24 +166,29 @@ def get_latest_sync_log(sync_type: str, data_type: str) -> dict | None:
     )
 
 
-def get_completed_stock_set(table: str, min_days_back: int) -> set[tuple[str, int]]:
+def get_existing_stock_set(table: str) -> set[tuple[str, int]]:
     """
-    一次性取出已完成全量铺底的股票集合。
-    条件：该股票最早数据距今达到阈值天数。
-    返回 {(stock_code, market), ...}
+    快速取出表中已经存在任意数据的股票集合。
+    用于全量续跑时快速跳过已处理股票，避免在大表上做 MIN(dt) 聚合。
     """
     from src.db.connection import fetchall
     rows = fetchall(
         f"""
-        SELECT stock_code, market
+        SELECT DISTINCT stock_code, market
         FROM {table}
-        GROUP BY stock_code, market
-        HAVING DATEDIFF(NOW(), MIN(dt)) >= %s
-        """,
-        (min_days_back,),
+        """
     )
     return {(r['stock_code'], r['market']) for r in rows}
 
+
+def get_record_count(table: str, stock_code: str, market: int) -> int:
+    """查询某只股票在某张K线表中的记录数"""
+    from src.db.connection import fetchone
+    row = fetchone(
+        f"SELECT COUNT(*) as cnt FROM {table} WHERE stock_code=%s AND market=%s",
+        (stock_code, market),
+    )
+    return row["cnt"] if row else 0
 
 def create_sync_log(sync_type: str, data_type: str, stock_code: str = None, market: int = None) -> int:
     """创建一条同步日志，返回 log id"""

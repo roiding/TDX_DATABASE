@@ -10,15 +10,15 @@
 设计目标：
 1. 可按阶段单独运行，兼容线上已有进度
 2. xdxr 若已在 sync_log 中成功完成过，则可跳过
-3. 5min / 1min 支持按股票续跑（基于最早时间判断是否已拉满）
+3. 5min / 1min 基于单股记录数阈值判断是否需要继续抓取
 4. K线全量同步支持多线程并发，加速铺底
 """
 
 from __future__ import annotations
 
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from src.config import get_config
 from src.fetcher.tdx_fetcher import TdxFetcher, FREQ_1MIN, FREQ_5MIN
 from src.db import dao
@@ -131,29 +131,44 @@ def _sync_all_xdxr(fetcher: TdxFetcher, stocks: list[dict]):
     logger.info(f"除权除息同步完成: {total_rows} 条, 失败 {failed} 只")
 
 
-def _fetch_and_save_one(stock: dict, table: str, frequency: int) -> tuple[str, int, int, str | None]:
+def _target_bar_count(frequency: int) -> int:
+    """根据频率返回目标bar数量阈值（按交易时段估算）"""
+    # 用户口径：1min 每天 60*4=240 根，5min 每天 12*4=48 根
+    if frequency == FREQ_1MIN:
+        return int(240 * 100 * 0.9)  # 100天，留10%余量
+    return int(48 * 700 * 0.9)       # 700天，留10%余量
+
+
+def _fetch_and_save_one(stock: dict, table: str, frequency: int, target_count: int) -> tuple[str, int, int, bool, str | None]:
     """
     单只股票全量同步任务。
-    返回 (stock_code, market, inserted_rows, error_msg)
+    返回 (stock_code, market, inserted_rows, skipped, error_msg)
     """
     code, market = stock["stock_code"], stock["market"]
     try:
+        existing_count = dao.get_record_count(table, code, market)
+        if existing_count >= target_count:
+            return code, market, 0, True, None
+
         fetcher = _get_worker_fetcher()
         bars = fetcher.fetch_kline(frequency, market, code)
         inserted = dao.batch_upsert_kline(table, bars) if bars else 0
-        return code, market, inserted, None
+        return code, market, inserted, False, None
     except Exception as e:
-        return code, market, 0, str(e)
+        return code, market, 0, False, str(e)
 
 
 def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
     """
     逐只同步K线数据。
-    断点续传逻辑：
-    - 查该股票已有数据的最早时间(MIN(dt))
-    - 如果最早时间距今已超过阈值（5min>=650天，1min>=90天），说明已拉满，跳过
-    - 否则从offset=0重新拉全量，INSERT IGNORE去重
-    - 使用线程池并发抓取加速全量铺底
+
+    热修策略：
+    - 不再启动时扫大表做 completed_set 聚合，避免卡死
+    - 对每只股票单独查 COUNT(*)
+    - 若 count 达到目标阈值，则直接跳过
+    - 若 count 不足，再抓取并依赖 INSERT IGNORE 补齐剩余部分
+
+    这样既避免 completed_set 大 SQL，又不会对已完成股票全部从头网络重抓。
     """
     log_id = dao.create_sync_log("full", label)
     total_rows = 0
@@ -164,47 +179,36 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
     sync_cfg = get_config().get("sync", {})
     full_workers = sync_cfg.get("full_workers", sync_cfg.get("workers", 1))
     progress_log_interval = sync_cfg.get("full_progress_log_interval", 20)
-    days_threshold = 650 if frequency == FREQ_5MIN else 90
+    target_count = _target_bar_count(frequency)
 
-    logger.info(f"[{label}] 正在计算已完成股票集合... days_threshold={days_threshold}")
-    start_ts = time.time()
-    done_set = dao.get_completed_stock_set(table, days_threshold)
-    elapsed = time.time() - start_ts
-    logger.info(f"[{label}] 已完成股票数: {len(done_set)}, 并发 workers={full_workers}, 计算耗时 {elapsed:.2f}s")
-
-    pending_stocks = []
-    for stock in stocks:
-        key = (stock["stock_code"], stock["market"])
-        if key in done_set:
-            skipped_count += 1
-        else:
-            pending_stocks.append(stock)
-
-    logger.info(f"[{label}] 待同步股票数: {len(pending_stocks)}, 跳过 {skipped_count}")
+    logger.info(f"[{label}] 按单股 count 阈值判断续跑, target_count={target_count}, workers={full_workers}")
+    logger.info(f"[{label}] 待检查股票数: {len(stocks)}")
 
     with ThreadPoolExecutor(max_workers=full_workers) as executor:
-        futures = [executor.submit(_fetch_and_save_one, stock, table, frequency) for stock in pending_stocks]
+        futures = [executor.submit(_fetch_and_save_one, stock, table, frequency, target_count) for stock in stocks]
         logger.info(f"[{label}] 已提交 {len(futures)} 个任务到线程池")
 
         for idx, future in enumerate(as_completed(futures), start=1):
-            code, market, inserted, error_msg = future.result()
+            code, market, inserted, skipped, error_msg = future.result()
             if error_msg:
                 failed_count += 1
                 logger.warning(f"[{label}][{code}] K线同步失败: {error_msg}")
+            elif skipped:
+                skipped_count += 1
             else:
                 synced_count += 1
                 total_rows += inserted
 
-            if idx % progress_log_interval == 0 or idx == len(pending_stocks):
+            if idx % progress_log_interval == 0 or idx == len(stocks):
                 logger.info(
-                    f"[{label}] 进度: {idx}/{len(pending_stocks)}, "
-                    f"已同步 {synced_count}, 跳过 {skipped_count}, 失败 {failed_count}, "
-                    f"累计 {total_rows} 条"
+                    f"[{label}] 进度: {idx}/{len(stocks)}, "
+                    f"已同步 {synced_count}, 已跳过 {skipped_count}, 失败 {failed_count}, "
+                    f"累计新增 {total_rows} 条"
                 )
 
     dao.finish_sync_log(log_id, total_rows, "success")
     logger.info(
         f"[{label}] 全量K线同步完成: "
         f"同步 {synced_count} 只, 跳过 {skipped_count} 只, 失败 {failed_count} 只, "
-        f"共 {total_rows} 条"
+        f"累计新增 {total_rows} 条"
     )
