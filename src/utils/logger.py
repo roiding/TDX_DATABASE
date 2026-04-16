@@ -18,6 +18,7 @@ def setup_logger():
         rotation=rotation,
         retention=retention,
         encoding="utf-8",
+        mode="w",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {module}:{function}:{line} | {message}",
     )
     return _logger
