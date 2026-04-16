@@ -30,6 +30,7 @@ sync:
   # 全量铺底：更激进的吞吐配置
   full_workers: 4
   full_request_interval: 0.01
+  full_progress_log_interval: 20
 
   # 每日增量：更保守，稳定优先
   daily_workers: 1

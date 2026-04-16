@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.config import get_config
 from src.fetcher.tdx_fetcher import TdxFetcher, FREQ_1MIN, FREQ_5MIN
@@ -162,9 +163,14 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
 
     sync_cfg = get_config().get("sync", {})
     full_workers = sync_cfg.get("full_workers", sync_cfg.get("workers", 1))
+    progress_log_interval = sync_cfg.get("full_progress_log_interval", 20)
     days_threshold = 650 if frequency == FREQ_5MIN else 90
+
+    logger.info(f"[{label}] 正在计算已完成股票集合... days_threshold={days_threshold}")
+    start_ts = time.time()
     done_set = dao.get_completed_stock_set(table, days_threshold)
-    logger.info(f"[{label}] 已完成股票数: {len(done_set)}, 并发 workers={full_workers}")
+    elapsed = time.time() - start_ts
+    logger.info(f"[{label}] 已完成股票数: {len(done_set)}, 并发 workers={full_workers}, 计算耗时 {elapsed:.2f}s")
 
     pending_stocks = []
     for stock in stocks:
@@ -178,6 +184,7 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
 
     with ThreadPoolExecutor(max_workers=full_workers) as executor:
         futures = [executor.submit(_fetch_and_save_one, stock, table, frequency) for stock in pending_stocks]
+        logger.info(f"[{label}] 已提交 {len(futures)} 个任务到线程池")
 
         for idx, future in enumerate(as_completed(futures), start=1):
             code, market, inserted, error_msg = future.result()
@@ -188,7 +195,7 @@ def _sync_all_kline(stocks: list[dict], table: str, frequency: int, label: str):
                 synced_count += 1
                 total_rows += inserted
 
-            if idx % 100 == 0:
+            if idx % progress_log_interval == 0 or idx == len(pending_stocks):
                 logger.info(
                     f"[{label}] 进度: {idx}/{len(pending_stocks)}, "
                     f"已同步 {synced_count}, 跳过 {skipped_count}, 失败 {failed_count}, "
