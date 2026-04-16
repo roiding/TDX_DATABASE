@@ -16,11 +16,26 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.config import get_config
 from src.fetcher.tdx_fetcher import TdxFetcher, FREQ_1MIN, FREQ_5MIN
 from src.db import dao
 from src.utils.logger import logger
+
+
+_thread_local = threading.local()
+
+
+def _get_worker_fetcher() -> TdxFetcher:
+    """每个 worker 线程复用一个 fetcher，避免每只股票都重新 connect 并刷日志。"""
+    fetcher = getattr(_thread_local, "fetcher", None)
+    if fetcher is None:
+        fetcher = TdxFetcher(mode="full")
+        if not fetcher.connect():
+            raise ConnectionError("无法连接 TDX 服务器")
+        _thread_local.fetcher = fetcher
+    return fetcher
 
 
 def run_full_sync(stage: str = "all"):
@@ -121,12 +136,11 @@ def _fetch_and_save_one(stock: dict, table: str, frequency: int) -> tuple[str, i
     返回 (stock_code, market, inserted_rows, error_msg)
     """
     code, market = stock["stock_code"], stock["market"]
-    fetcher = TdxFetcher(mode="full")
     try:
-        with fetcher:
-            bars = fetcher.fetch_kline(frequency, market, code)
-            inserted = dao.batch_upsert_kline(table, bars) if bars else 0
-            return code, market, inserted, None
+        fetcher = _get_worker_fetcher()
+        bars = fetcher.fetch_kline(frequency, market, code)
+        inserted = dao.batch_upsert_kline(table, bars) if bars else 0
+        return code, market, inserted, None
     except Exception as e:
         return code, market, 0, str(e)
 
